@@ -110,3 +110,13 @@ func TestResolveVolumeDevice(t *testing.T) {
 		t.Fatalf("vanished link not retryable: %v", err)
 	}
 }
+
+// Captured on qubit-live-03 on 2026-10-04 from /sys/block/sdb/device/vpd_pg80 for volume 106963407,
+// read both on the host and inside the node plugin container.
+func TestUnitSerialNumberHetznerFixture(t *testing.T) {
+	page := []byte{0x00, 0x80, 0x00, 0x09, '1', '0', '6', '9', '6', '3', '4', '0', '7'}
+	got, err := unitSerialNumber(page)
+	if err != nil || got != "106963407" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
