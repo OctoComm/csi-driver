@@ -105,7 +105,8 @@ func TestResolveVolumeDevice(t *testing.T) {
 	if _, err := resolveVolumeDevice(link("106963406", "sdb1")); !errors.Is(err, ErrDeviceMismatch) {
 		t.Fatalf("partition accepted: %v", err)
 	}
-	if _, err := resolveVolumeDevice(filepath.Join(byIDDir, "scsi-0HC_Volume_1")); err == nil {
-		t.Fatal("missing link verified")
+	// A link removed after the caller's stat is retried like a mismatch.
+	if _, err := resolveVolumeDevice(filepath.Join(byIDDir, "scsi-0HC_Volume_1")); !errors.Is(err, ErrDeviceMismatch) {
+		t.Fatalf("vanished link not retryable: %v", err)
 	}
 }

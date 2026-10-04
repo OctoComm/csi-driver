@@ -27,8 +27,9 @@ var (
 //
 // For a Hetzner Volume by-id path it resolves the udev symlink once and requires the resolved disk's
 // unit serial number (VPD page 0x80, which Hetzner sets to the volume ID) to equal the ID in the path.
-// Callers format and mount the returned node, not the symlink, so a later symlink change cannot
-// redirect the operation. Unreadable or malformed identity fails closed. Other paths are returned
+// Callers format and mount the returned node, not the symlink, so later udev changes to the by-id
+// link cannot redirect the operation. This does not pin the device's lifetime: hot-unplug and reuse
+// of the same sdX name between verification and mount is out of scope. Unreadable or malformed identity fails closed. Other paths are returned
 // unchanged.
 func resolveVolumeDevice(devicePath string) (string, error) {
 	match := hetznerVolumeLink.FindStringSubmatch(filepath.Base(devicePath))
@@ -39,7 +40,8 @@ func resolveVolumeDevice(devicePath string) (string, error) {
 
 	resolved, err := filepath.EvalSymlinks(devicePath)
 	if err != nil {
-		return "", err
+		// udev may remove or replace the link between the caller's stat and this resolution.
+		return "", fmt.Errorf("%w: resolving %s: %v", ErrDeviceMismatch, devicePath, err)
 	}
 	disk := filepath.Base(resolved)
 	if filepath.Dir(resolved) != devDir || !wholeSCSIDisk.MatchString(disk) {
