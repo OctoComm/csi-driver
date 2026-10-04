@@ -62,7 +62,8 @@ func NewLinuxMountService(logger *slog.Logger) *LinuxMountService {
 func (s *LinuxMountService) Publish(ctx context.Context, targetPath string, devicePath string, opts MountOpts) error {
 	// Ensure device is ready via stat syscall. Otherwise, `blkid` might return
 	// exit code 2, which is the same exit code as for an unformatted device.
-	if err := s.waitDeviceReady(ctx, devicePath); err != nil {
+	sourceDevice, err := s.waitDeviceReady(ctx, devicePath)
+	if err != nil {
 		return fmt.Errorf("device %q not ready: %w", devicePath, err)
 	}
 
@@ -111,7 +112,7 @@ func (s *LinuxMountService) Publish(ctx context.Context, targetPath string, devi
 	}
 
 	if opts.EncryptionPassphrase != "" {
-		existingFSType, err := s.mounter.GetDiskFormat(devicePath)
+		existingFSType, err := s.mounter.GetDiskFormat(sourceDevice)
 		if err != nil {
 			return fmt.Errorf("unable to detect existing disk format of %s: %w", devicePath, err)
 		}
@@ -120,23 +121,23 @@ func (s *LinuxMountService) Publish(ctx context.Context, targetPath string, devi
 			if opts.Readonly {
 				return fmt.Errorf("cannot publish unformatted disk %s in read-only mode", devicePath)
 			}
-			if err = s.cryptSetup.Format(ctx, devicePath, opts.EncryptionPassphrase); err != nil {
+			if err = s.cryptSetup.Format(ctx, sourceDevice, opts.EncryptionPassphrase); err != nil {
 				return err
 			}
 		} else if existingFSType != "crypto_LUKS" {
 			return fmt.Errorf("requested encrypted volume, but disk %s already is formatted with %s", devicePath, existingFSType)
 		}
-		if err := s.cryptSetup.Open(ctx, devicePath, luksDeviceName, opts.EncryptionPassphrase); err != nil {
+		if err := s.cryptSetup.Open(ctx, sourceDevice, luksDeviceName, opts.EncryptionPassphrase); err != nil {
 			return err
 		}
-		luksDevicePath := GenerateLUKSDevicePath(luksDeviceName)
-		devicePath = luksDevicePath
+		sourceDevice = GenerateLUKSDevicePath(luksDeviceName)
 	}
 
 	s.logger.Info(
 		"publishing volume",
 		"target-path", targetPath,
 		"device-path", devicePath,
+		"source-device", sourceDevice,
 		"fs-type", opts.FSType,
 		"block-volume", opts.BlockVolume,
 		"readonly", opts.Readonly,
@@ -145,7 +146,7 @@ func (s *LinuxMountService) Publish(ctx context.Context, targetPath string, devi
 	)
 
 	if opts.BlockVolume {
-		return s.mounter.MountSensitive(devicePath, targetPath, opts.FSType, mountOptions, opts.Additional)
+		return s.mounter.MountSensitive(sourceDevice, targetPath, opts.FSType, mountOptions, opts.Additional)
 	}
 
 	formatOptions := make([]string, 0)
@@ -160,12 +161,13 @@ func (s *LinuxMountService) Publish(ctx context.Context, targetPath string, devi
 		formatOptions = append(formatOptions, "-c", fmt.Sprintf("options=%s", XFSDefaultConfigPath))
 	}
 
-	return s.mounter.FormatAndMountSensitiveWithFormatOptions(devicePath, targetPath, opts.FSType, mountOptions, opts.Additional, formatOptions)
+	return s.mounter.FormatAndMountSensitiveWithFormatOptions(sourceDevice, targetPath, opts.FSType, mountOptions, opts.Additional, formatOptions)
 }
 
-// waitDeviceReady ensures the device at devicePath exists. This is done by ensuring a stat
-// syscall returns no error.
-func (s *LinuxMountService) waitDeviceReady(ctx context.Context, devicePath string) error {
+// waitDeviceReady waits until devicePath exists and, for Hetzner Volumes, resolves to the disk that
+// carries the requested volume serial. It returns the device node to format and mount. A missing path
+// or a mismatching serial is retried, since udev may still be updating /dev/disk/by-id.
+func (s *LinuxMountService) waitDeviceReady(ctx context.Context, devicePath string) (string, error) {
 	const maxRetries = 7
 	backoffFunc := hcloud.ExponentialBackoffWithOpts(hcloud.ExponentialBackoffOpts{
 		Base:       time.Millisecond * 50,
@@ -178,13 +180,20 @@ func (s *LinuxMountService) waitDeviceReady(ctx context.Context, devicePath stri
 		var stat unix.Stat_t
 		err = unix.Stat(devicePath, &stat)
 		if err == nil {
-			return nil
+			var resolved string
+			resolved, err = resolveVolumeDevice(devicePath)
+			if err == nil {
+				return resolved, nil
+			}
+			if !errors.Is(err, ErrDeviceMismatch) {
+				return "", err
+			}
+			s.logger.Warn("device identity not verified yet", "devicePath", devicePath, "error", err)
+		} else if !errors.Is(err, unix.ENOENT) {
+			return "", err
+		} else {
+			s.logger.Debug("device not ready yet: stat syscall returned ENOENT", "devicePath", devicePath)
 		}
-		if !errors.Is(err, unix.ENOENT) {
-			return err
-		}
-
-		s.logger.Debug("device not ready yet: stat syscall returned ENOENT", "devicePath", devicePath)
 
 		if i == maxRetries-1 {
 			break
@@ -192,12 +201,12 @@ func (s *LinuxMountService) waitDeviceReady(ctx context.Context, devicePath stri
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("waiting for device %s: %w", devicePath, ctx.Err())
+			return "", fmt.Errorf("waiting for device %s: %w", devicePath, ctx.Err())
 		case <-time.After(backoffFunc(i)):
 		}
 	}
 
-	return err
+	return "", err
 }
 
 func (s *LinuxMountService) Unpublish(ctx context.Context, targetPath string) error {
